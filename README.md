@@ -1,24 +1,80 @@
-# Tata Telephony - ElevenLabs WebSocket Bridge
+# Tata Telephony to ElevenLabs WebSocket Bridge
 
-A WebSocket bridge that connects Tata Telephony voice streams to ElevenLabs Conversational AI agents. Tata sends and receives audio as G.711 mulaw at 8000 Hz. ElevenLabs is configured to use the same format, so audio passes through without any conversion.
+A WebSocket bridge that connects Tata SmartFlo voice streams to ElevenLabs Conversational AI agents. Supports both static and dynamic WebSocket endpoints, click-to-call UI, and custom parameter passthrough.
 
-## How It Works
+Audio is G.711 mulaw at 8000 Hz in both directions. No conversion is needed.
 
-Tata connects to the bridge over WebSocket and drives the following lifecycle:
+## Architecture
 
-1. Sends a `connected` event as a handshake
-2. Sends a `start` event with call metadata (caller number, direction, stream ID)
-3. Streams `media` events containing base64-encoded mulaw audio every 100ms
-4. Sends a `stop` event when the call ends
+```
+                         +---------------------+
+                         |   Tata SmartFlo     |
+                         |   Voice Streaming   |
+                         +--------+------------+
+                                  |
+                    1. POST /tata (dynamic endpoint)
+                    2. Returns wss:// URL with query params
+                                  |
+                         +--------v------------+
+                         |     nginx (SSL)     |
+                         |   reverse proxy     |
+                         +--------+------------+
+                                  |
+                         +--------v------------+
+                         |   Bridge Server     |
+                         |   (FastAPI + WS)    |
+                         |                     |
+                         |  /tata   - dynamic  |
+                         |  /ws     - websocket|
+                         |  /       - UI       |
+                         +--------+------------+
+                                  |
+                    WebSocket with dynamic_variables
+                    (callId, fromNumber, toNumber, etc.)
+                                  |
+                         +--------v------------+
+                         |    ElevenLabs       |
+                         |  Conversational AI  |
+                         +---------------------+
+```
 
-The bridge opens a WebSocket to ElevenLabs on `start`, relays audio in both directions, and handles ElevenLabs control events (interruptions, pings, transcripts).
+### Call Flow
+
+1. A call is initiated (via click-to-call UI or Tata SmartFlo)
+2. Tata hits `POST /tata` with call metadata (callId, fromNumber, toNumber, status, custom vars)
+3. The bridge returns a `wss://` URL with all variables encoded as query parameters
+4. Tata connects to that WebSocket and starts streaming audio
+5. On the `start` event, the bridge opens a WebSocket to ElevenLabs and sends all collected variables as `dynamic_variables` in `conversation_initiation_client_data`
+6. Audio flows bidirectionally: Tata caller <-> Bridge <-> ElevenLabs agent
+
+### Data Flow for Dynamic Variables
+
+Variables are collected from three sources and merged before being sent to ElevenLabs:
+
+```
+Source 1: Query params from /tata dynamic endpoint
+          (callId, fromNumber, toNumber, status, custom vars)
+                              |
+Source 2: Tata "start" event  |
+          (account_sid,       |
+           call_sid,          +---> merged into dynamic_variables
+           stream_sid,        |     sent to ElevenLabs
+           from_number,       |
+           to_number,         |
+           direction)         |
+                              |
+Source 3: Tata "start" event  |
+          customParameters    |
+```
+
+If keys overlap, later sources override earlier ones.
 
 ## Files
 
 | File | Purpose |
 |---|---|
-| `server.py` | FastAPI application, WebSocket endpoint, bridge logic |
-| `audio_converter.py` | G.711 mulaw codec and audio output buffer |
+| `server.py` | FastAPI app, WebSocket bridge, dynamic endpoint, click-to-call UI |
+| `audio_converter.py` | Audio output buffer for chunked delivery |
 | `requirements.txt` | Python dependencies |
 | `.env.example` | Template for environment variables |
 
@@ -26,6 +82,7 @@ The bridge opens a WebSocket to ElevenLabs on `start`, relays audio in both dire
 
 - Python 3.9 or later
 - An ElevenLabs Conversational AI agent configured with `ulaw_8000` audio format
+- A Tata SmartFlo account with Voice Streaming enabled
 
 ## Local Setup
 
@@ -35,7 +92,7 @@ source venv/bin/activate
 pip install -r requirements.txt
 
 cp .env.example .env
-# Edit .env and set ELEVENLABS_AGENT_ID
+# Edit .env with your credentials
 ```
 
 Start the server:
@@ -44,14 +101,18 @@ Start the server:
 python server.py
 ```
 
-The server runs on `http://0.0.0.0:8000` by default. The WebSocket endpoint is `/ws`.
+The server runs on `http://0.0.0.0:8000` by default.
 
 ## Environment Variables
 
 | Variable | Required | Description |
 |---|---|---|
-| `ELEVENLABS_AGENT_ID` | Yes | Default ElevenLabs agent ID to route calls to |
-| `ELEVENLABS_WS_URL` | No | Override the ElevenLabs WebSocket base URL (for EU/US/India residency) |
+| `ELEVENLABS_AGENT_ID` | Yes | ElevenLabs agent ID for routing calls |
+| `ELEVENLABS_WS_URL` | No | ElevenLabs WebSocket URL (default: global endpoint, set for EU/US/India residency) |
+| `TATA_CTC_API_KEY` | For click-to-call | Tata SmartFlo API key |
+| `TATA_CALLER_ID` | For click-to-call | DID number registered in your Tata account |
+| `TATA_CTC_URL` | No | Tata click-to-call API URL |
+| `WSS_PUBLIC_HOST` | For dynamic endpoint | Public hostname for the WSS URL returned by `/tata` |
 | `HOST` | No | Bind host, default `0.0.0.0` |
 | `PORT` | No | Bind port, default `8000` |
 
@@ -60,6 +121,58 @@ The agent ID can also be passed per-connection as a query parameter:
 ```
 wss://your-server/ws?agent_id=your_agent_id
 ```
+
+## Endpoints
+
+| Path | Method | Description |
+|---|---|---|
+| `/` | GET | Click-to-call UI with live payload preview |
+| `/tata` | POST/GET | Dynamic voice endpoint. Returns `{"sucess": true, "wss_url": "wss://..."}` |
+| `/ws` | WebSocket | Main endpoint for Tata voice streaming |
+| `/api/click-to-call` | POST | JSON API to initiate calls via Tata SmartFlo |
+| `/health` | GET | Liveness probe |
+
+## Dynamic Endpoint
+
+Configure this in Tata SmartFlo under Settings > Channels > Voice Bot as a **Dynamic** endpoint.
+
+**Setup:**
+- Endpoint type: Dynamic
+- Method: POST
+- URL: `https://your-server/tata`
+
+**Body variables to map:**
+
+| Key | Value |
+|---|---|
+| `callId` | `$callId` |
+| `fromNumber` | `$fromNumber` |
+| `toNumber` | `$toNumber` |
+| `status` | `$status` |
+
+You can add any additional custom key-value pairs. All variables are forwarded to ElevenLabs.
+
+**Response format** (returned within 2 seconds):
+
+```json
+{
+  "sucess": true,
+  "wss_url": "wss://your-server/ws?callId=abc&fromNumber=%2B91..."
+}
+```
+
+Note: The key is `sucess` (not `success`), as required by Tata SmartFlo's API contract.
+
+## Click-to-Call UI
+
+The UI at `/` lets you:
+
+- Enter a customer phone number
+- Add custom key-value parameters (sent to Tata's click-to-call API)
+- See a live-updating curl preview of the request payload
+- Initiate calls without page reload
+
+Requires `TATA_CTC_API_KEY` and `TATA_CALLER_ID` in `.env`.
 
 ## AWS EC2 Deployment
 
@@ -75,7 +188,7 @@ python3 -m venv venv
 source venv/bin/activate
 pip install -r requirements.txt
 cp .env.example .env
-# Edit .env with your ELEVENLABS_AGENT_ID
+# Edit .env with your credentials
 ```
 
 ### Running the Server
@@ -85,12 +198,6 @@ cd ~/tata-bridge
 source venv/bin/activate
 nohup python server.py >> logs.txt 2>&1 &
 echo $! > server.pid
-```
-
-To stop:
-
-```bash
-kill $(cat ~/tata-bridge/server.pid)
 ```
 
 To restart:
@@ -104,18 +211,16 @@ echo $! > server.pid
 
 ### SSL with nginx
 
-Install a certificate using a DNS-based hostname (example uses sslip.io with the EC2 public IP):
-
 ```bash
-sudo certbot --nginx -d <EC2_IP>.sslip.io
+sudo certbot --nginx -d your-domain.example.com
 ```
 
-Sample nginx config at `/etc/nginx/sites-available/tata-bridge`:
+Sample nginx config:
 
 ```nginx
 server {
     listen 443 ssl;
-    server_name <EC2_IP>.sslip.io;
+    server_name your-domain.example.com;
 
     location /ws {
         proxy_pass http://127.0.0.1:8000/ws;
@@ -126,60 +231,49 @@ server {
         proxy_read_timeout 3600;
     }
 
-    location /health {
-        proxy_pass http://127.0.0.1:8000/health;
-    }
-
     location / {
-        return 444;
+        proxy_pass http://127.0.0.1:8000;
+        proxy_set_header Host $host;
+        proxy_set_header X-Real-IP $remote_addr;
+        proxy_set_header X-Forwarded-Proto $scheme;
     }
 }
 
 server {
     listen 80;
-    server_name <EC2_IP>.sslip.io;
+    server_name your-domain.example.com;
     return 301 https://$host$request_uri;
 }
 ```
 
 ### Security Group Rules
 
-Open the following ports in the EC2 security group:
-
 | Port | Protocol | Source | Purpose |
 |---|---|---|---|
 | 22 | TCP | Your IP only | SSH access |
-| 80 | TCP | 0.0.0.0/0 | HTTP (redirects to HTTPS) |
+| 80 | TCP | 0.0.0.0/0 | HTTP redirect to HTTPS |
 | 443 | TCP | 0.0.0.0/0 | HTTPS and WSS |
 
-Block direct access to port 8000 from outside (nginx proxies internally).
+Block direct access to port 8000 from outside.
 
-## WebSocket Endpoint
-
-| Path | Protocol | Description |
-|---|---|---|
-| `/ws` | WebSocket | Main endpoint for Tata Telephony |
-| `/health` | HTTP GET | Liveness probe, returns `{"status": "ok"}` |
-
-The bridge accepts HTTP GET requests on `/ws` for health probes from Tata's infrastructure and returns `200 OK`. Actual WebSocket connections upgrade normally.
-
-## Monitoring Logs
+## Monitoring
 
 ```bash
 tail -f ~/tata-bridge/logs.txt
 ```
 
-A successful call produces log lines in this order:
+A successful call produces log output like:
 
 ```
-Tata connected from <IP> (agent=<agent_id>)
+[Dynamic] POST /tata  params={'callId': '...', 'fromNumber': '+91...', ...}
+[Dynamic] Returning wss_url=wss://...
+Tata connected from <IP> (agent=<agent_id>)  query_vars={...}
 [Tata] connected (handshake)
-[Tata] start  sid=...  from=...  to=...  direction=inbound
+[Tata] start  sid=...  from=...  to=...
 Connecting to ElevenLabs: wss://...
 ElevenLabs connected for stream ...
 [EL] conversation_initiation_metadata  agent_out=ulaw_8000  user_in=ulaw_8000
 [EL] agent_response: Hello! How can I help you today?
-[Tata] mark ACK  name=el_1 ...
 [EL] user_transcript: <caller speech>
 ...
 [Tata] stop
