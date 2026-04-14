@@ -6,36 +6,52 @@ Audio is G.711 mulaw at 8000 Hz in both directions. No conversion is needed.
 
 ## Architecture
 
-```
-                         +---------------------+
-                         |   Tata SmartFlo     |
-                         |   Voice Streaming   |
-                         +--------+------------+
-                                  |
-                    1. POST /tata (dynamic endpoint)
-                    2. Returns wss:// URL with query params
-                                  |
-                         +--------v------------+
-                         |     nginx (SSL)     |
-                         |   reverse proxy     |
-                         +--------+------------+
-                                  |
-                         +--------v------------+
-                         |   Bridge Server     |
-                         |   (FastAPI + WS)    |
-                         |                     |
-                         |  /tata   - dynamic  |
-                         |  /ws     - websocket|
-                         |  /       - UI       |
-                         +--------+------------+
-                                  |
-                    WebSocket with dynamic_variables
-                    (callId, fromNumber, toNumber, etc.)
-                                  |
-                         +--------v------------+
-                         |    ElevenLabs       |
-                         |  Conversational AI  |
-                         +---------------------+
+```mermaid
+flowchart TB
+    subgraph Tata["Tata SmartFlo"]
+        TS["Voice Streaming"]
+    end
+
+    subgraph Nginx["nginx (SSL)"]
+        RP["Reverse Proxy"]
+    end
+
+    subgraph Bridge["Bridge Server (FastAPI)"]
+        direction TB
+        DE["/tata\nDynamic Endpoint"]
+        WS["/ws\nWebSocket Stream"]
+        UI["/\nClick-to-Call UI"]
+    end
+
+    subgraph EL["ElevenLabs"]
+        AI["Conversational AI Agent"]
+    end
+
+    TS -- "1. POST /tata\n{callId, fromNumber, toNumber, status}" --> RP
+    RP --> DE
+    DE -- "2. Returns wss:// URL\nwith query params" --> RP
+    RP --> TS
+
+    TS -- "3. Connect to wss://host/ws?callId=...&fromNumber=..." --> RP
+    RP --> WS
+
+    WS -- "4. WebSocket + dynamic_variables\n(callId, fromNumber, toNumber, status)" --> AI
+    AI -- "Agent audio (mulaw 8kHz)" --> WS
+    WS -- "Caller audio (mulaw 8kHz)" --> AI
+
+    WS -- "Media events\n(base64 mulaw)" --> TS
+    TS -- "Media events\n(base64 mulaw)" --> WS
+
+    style Tata fill:#1e3a5f,stroke:#2d5a8e,color:#fff
+    style Nginx fill:#374151,stroke:#4b5563,color:#fff
+    style Bridge fill:#4338ca,stroke:#6366f1,color:#fff
+    style EL fill:#065f46,stroke:#059669,color:#fff
+    style DE fill:#5b21b6,stroke:#7c3aed,color:#fff
+    style WS fill:#5b21b6,stroke:#7c3aed,color:#fff
+    style UI fill:#5b21b6,stroke:#7c3aed,color:#fff
+    style TS fill:#1e40af,stroke:#3b82f6,color:#fff
+    style RP fill:#4b5563,stroke:#6b7280,color:#fff
+    style AI fill:#047857,stroke:#10b981,color:#fff
 ```
 
 ### Call Flow
@@ -45,26 +61,41 @@ Audio is G.711 mulaw at 8000 Hz in both directions. No conversion is needed.
 3. The bridge returns a `wss://` URL with all variables encoded as query parameters
 4. Tata connects to that WebSocket and starts streaming audio
 5. On the `start` event, the bridge opens a WebSocket to ElevenLabs and sends all collected variables as `dynamic_variables` in `conversation_initiation_client_data`
-6. Audio flows bidirectionally: Tata caller <-> Bridge <-> ElevenLabs agent
+6. Audio flows bidirectionally between Tata caller, Bridge, and ElevenLabs agent
 
-### Data Flow for Dynamic Variables
+### Dynamic Variables Data Flow
 
 Variables are collected from three sources and merged before being sent to ElevenLabs:
 
-```
-Source 1: Query params from /tata dynamic endpoint
-          (callId, fromNumber, toNumber, status, custom vars)
-                              |
-Source 2: Tata "start" event  |
-          (account_sid,       |
-           call_sid,          +---> merged into dynamic_variables
-           stream_sid,        |     sent to ElevenLabs
-           from_number,       |
-           to_number,         |
-           direction)         |
-                              |
-Source 3: Tata "start" event  |
-          customParameters    |
+```mermaid
+flowchart LR
+    subgraph S1["Source 1: /tata Endpoint"]
+        Q["callId\nfromNumber\ntoNumber\nstatus\ncustom vars"]
+    end
+
+    subgraph S2["Source 2: Tata start Event"]
+        E["account_sid\ncall_sid\nstream_sid\nfrom_number\nto_number\ndirection"]
+    end
+
+    subgraph S3["Source 3: customParameters"]
+        C["Any key-value pairs\nfrom Tata start event"]
+    end
+
+    M["Merged\ndynamic_variables"]
+
+    S1 --> M
+    S2 --> M
+    S3 --> M
+    M --> EL["ElevenLabs\nconversation_initiation_client_data"]
+
+    style S1 fill:#1e3a5f,stroke:#2d5a8e,color:#fff
+    style S2 fill:#374151,stroke:#4b5563,color:#fff
+    style S3 fill:#4338ca,stroke:#6366f1,color:#fff
+    style M fill:#7c2d12,stroke:#c2410c,color:#fff
+    style EL fill:#065f46,stroke:#059669,color:#fff
+    style Q fill:#1e40af,stroke:#3b82f6,color:#fff
+    style E fill:#4b5563,stroke:#6b7280,color:#fff
+    style C fill:#5b21b6,stroke:#7c3aed,color:#fff
 ```
 
 If keys overlap, later sources override earlier ones.
