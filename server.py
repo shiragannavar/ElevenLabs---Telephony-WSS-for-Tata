@@ -29,17 +29,19 @@ logging.basicConfig(
 logger = logging.getLogger("bridge")
 
 ELEVENLABS_AGENT_ID: str = os.getenv("ELEVENLABS_AGENT_ID", "")
+ELEVENLABS_AGENT_ID_INBOUND: str = os.getenv("ELEVENLABS_AGENT_ID_INBOUND", "")
+ELEVENLABS_AGENT_ID_OUTBOUND: str = os.getenv("ELEVENLABS_AGENT_ID_OUTBOUND", "")
 ELEVENLABS_WS_URL: str = os.getenv(
     "ELEVENLABS_WS_URL",
-    "wss://api.elevenlabs.io/v1/convai/conversation",
+    "wss://api.in.residency.elevenlabs.io/v1/convai/conversation",
 )
 TATA_CTC_API_KEY: str = os.getenv("TATA_CTC_API_KEY", "")
-TATA_CALLER_ID: str = os.getenv("TATA_CALLER_ID", "")
+TATA_CALLER_ID: str = os.getenv("TATA_CALLER_ID", "918069651024")
 TATA_CTC_URL: str = os.getenv(
     "TATA_CTC_URL",
     "https://api-smartflo.tatateleservices.com/v1/click_to_call_support",
 )
-WSS_PUBLIC_HOST: str = os.getenv("WSS_PUBLIC_HOST", "localhost:8000")
+WSS_PUBLIC_HOST: str = os.getenv("WSS_PUBLIC_HOST", "3.109.216.10.sslip.io")
 HOST: str = os.getenv("HOST", "0.0.0.0")
 PORT: int = int(os.getenv("PORT", "8000"))
 
@@ -52,9 +54,16 @@ class ClickToCallBody(BaseModel):
 
 
 class BridgeSession:
-    def __init__(self, tata_ws: WebSocket, agent_id: str, query_vars: Optional[dict] = None) -> None:
+    def __init__(
+        self,
+        tata_ws: WebSocket,
+        agent_id: str,
+        query_vars: Optional[dict] = None,
+        agent_id_from_url: bool = False,
+    ) -> None:
         self.tata_ws = tata_ws
         self.agent_id = agent_id
+        self.agent_id_from_url = agent_id_from_url
         self.query_vars: dict = query_vars or {}
         self.el_ws: Optional[websockets.WebSocketClientProtocol] = None
         self._el_listener_task: Optional[asyncio.Task] = None
@@ -132,6 +141,27 @@ class BridgeSession:
             start.get("mediaFormat", {}).get("encoding", "?"),
             start.get("mediaFormat", {}).get("sampleRate", "?"),
         )
+
+        if not self.agent_id_from_url:
+            direction = (call_metadata["direction"] or "").strip().lower()
+            if direction == "inbound" and ELEVENLABS_AGENT_ID_INBOUND:
+                self.agent_id = ELEVENLABS_AGENT_ID_INBOUND
+            elif direction == "outbound" and ELEVENLABS_AGENT_ID_OUTBOUND:
+                self.agent_id = ELEVENLABS_AGENT_ID_OUTBOUND
+
+        if not self.agent_id:
+            logger.error(
+                "No agent_id resolved (direction=%s, url=%s, env defaults missing)",
+                call_metadata["direction"], self.agent_id_from_url,
+            )
+            await self.close()
+            return
+
+        logger.info(
+            "Resolved agent_id=%s  (direction=%s, from_url=%s)",
+            self.agent_id, call_metadata["direction"], self.agent_id_from_url,
+        )
+
         await self.connect_elevenlabs(call_metadata)
 
     async def _on_media(self, msg: dict) -> None:
@@ -317,14 +347,29 @@ class BridgeSession:
 async def websocket_endpoint(websocket: WebSocket) -> None:
     await websocket.accept()
     qs = dict(websocket.query_params)
-    resolved_agent_id = qs.pop("agent_id", "").strip() or ELEVENLABS_AGENT_ID
-    if not resolved_agent_id:
-        logger.error("No agent_id provided and ELEVENLABS_AGENT_ID is not set")
+    url_agent_id = qs.pop("agent_id", "").strip()
+    resolved_agent_id = url_agent_id or ELEVENLABS_AGENT_ID
+    has_direction_defaults = bool(
+        ELEVENLABS_AGENT_ID_INBOUND or ELEVENLABS_AGENT_ID_OUTBOUND
+    )
+    if not (resolved_agent_id or has_direction_defaults):
+        logger.error(
+            "No agent_id provided and no ELEVENLABS_AGENT_ID / "
+            "ELEVENLABS_AGENT_ID_INBOUND / ELEVENLABS_AGENT_ID_OUTBOUND set"
+        )
         await websocket.close(code=1008, reason="agent_id is required")
         return
     client = getattr(websocket.client, "host", "unknown")
-    logger.info("Tata connected from %s (agent=%s)  query_vars=%s", client, resolved_agent_id, qs)
-    session = BridgeSession(websocket, resolved_agent_id, query_vars=qs)
+    logger.info(
+        "Tata connected from %s (agent=%s, from_url=%s)  query_vars=%s",
+        client, resolved_agent_id or "<deferred>", bool(url_agent_id), qs,
+    )
+    session = BridgeSession(
+        websocket,
+        resolved_agent_id,
+        query_vars=qs,
+        agent_id_from_url=bool(url_agent_id),
+    )
     try:
         async for text in websocket.iter_text():
             if not session.active:
